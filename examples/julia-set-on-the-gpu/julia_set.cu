@@ -124,9 +124,15 @@ int main()
         }
 
         // Launch kernel
+        // 256 threads per block
         dim3 blockSize(16, 16);
+
+        // Calculate ceil(dim_x / blockSize.x) and ceil(dim_y / blockSize.y)
+        // i.e the number of blocks needed in each dimension
+        // This ensures we cover the entire image
         dim3 gridSize((DIM_X + blockSize.x - 1) / blockSize.x,
                       (DIM_Y + blockSize.y - 1) / blockSize.y);
+        
         drawJuliaKernel<<<gridSize, blockSize>>>(zoom, d_bitmap);
         cudaDeviceSynchronize(); // Wait for GPU to finish
 
