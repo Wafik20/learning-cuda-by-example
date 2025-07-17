@@ -1,1 +1,1 @@
-# cuda-parallel-algorithms
+# learning-cuda-by-example
