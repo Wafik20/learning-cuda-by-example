@@ -58,6 +58,9 @@ void drawJuliaKernel(float zoom, uint32_t *bitmap)
         for(int y = 0; y < DIM_Y; y++)
         {
             int iterations = julia(x, y, zoom);
+            // Map iterations to grayscale value
+            // 0 for max iterations (200), 255 for min (0)
+            // This will create a gradient effect based on the number of iterations
             uint8_t gray = (iterations == 200) ? 0 : (uint8_t)(255.0f * iterations / 200.0f);
             setPixel(bitmap, x, y, gray, gray, gray, 255);
         }
