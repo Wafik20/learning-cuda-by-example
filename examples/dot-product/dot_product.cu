@@ -1,107 +1,122 @@
 #include <iostream>
-#include <vector>
-#include <chrono>
 #include <random>
+#include <cuda_runtime.h>
 using namespace std;
 
-#define CUDA_CHECK(call)                                                                                         \
-    do                                                                                                           \
-    {                                                                                                            \
-        cudaError_t err = call;                                                                                  \
-        if (err != cudaSuccess)                                                                                  \
-        {                                                                                                        \
-            cerr << "CUDA error in " << __FILE__ << ":" << __LINE__ << " - " << cudaGetErrorString(err) << endl; \
-            exit(EXIT_FAILURE);                                                                                  \
-        }                                                                                                        \
-    } while (0);
+#define THREADS_PER_BLOCK 256
 
-#define imin(a, b) (a < b ? a : b)
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        cerr << "CUDA error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << endl; \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
-#define N 50'000'000                                                              // 50 million elements, adjust as needed
-#define THREADS_PER_BLOCK 256                                                     // divisible by 32 for warp size
-#define BLOCKS_PER_GRID imin(32, (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK) // block_per_grid = min(32, ceil(N / THREADS_PER_BLOCK))
-
-__global__ void dot_product(const float *a, const float *b, int n, float *c)
-{
-    __shared__ float cache[THREADS_PER_BLOCK];
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; // flatten 2D grid to 1D
-    int tid = threadIdx.x;
-    float temp = 0.0f;
-
-    // A grid-stride loop to cover all indices i ∈ [0, n)
-    while (idx < n)
-    {
-        temp += a[idx] * b[idx];
-        idx += blockDim.x * gridDim.x;
-    }
-
-    cache[tid] = temp;
-    __syncthreads();
-
-    // prefix sum reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s)
-            cache[tid] += cache[tid + s];
-        __syncthreads();
-    }
-
-    // Thread 0 of each block writes block sum to global memory
-    if (tid == 0)
-        c[blockIdx.x] = cache[0];
+__inline__ __device__ float warpReduceSum(float val) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
 }
 
-int main()
-{
-    float *a = new float[N];
-    float *b = new float[N];
+__global__ void dot_product_kernel(const float *__restrict__ a, const float *__restrict__ b, int n, float *__restrict__ result) {
+    float sum = 0.0f;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
 
-    // Fill arrays with random float data
+    for (int i = idx; i < n; i += stride)
+        sum += a[i] * b[i];
+
+    // Reduce within warp
+    sum = warpReduceSum(sum);
+
+    // First thread of each warp writes to shared memory
+    constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
+    __shared__ float shared[WARPS_PER_BLOCK];
+
+    if (threadIdx.x % warpSize == 0)
+        shared[threadIdx.x / warpSize] = sum;
+
+    __syncthreads();
+
+    // Final reduction by first warp
+    if (threadIdx.x < THREADS_PER_BLOCK / warpSize) {
+        sum = shared[threadIdx.x];
+        sum = warpReduceSum(sum);
+    }
+
+    if (threadIdx.x == 0)
+        atomicAdd(result, sum);
+}
+
+float compute_dot_product(const float *a, const float *b, int n) {
+    float *dev_a, *dev_b, *dev_result;
+    float result = 0.0f;
+
+    // Allocate GPU memory
+    CUDA_CHECK(cudaMalloc(&dev_a, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dev_b, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dev_result, sizeof(float)));
+    CUDA_CHECK(cudaMemset(dev_result, 0, sizeof(float)));
+
+    // Copy data to GPU
+    CUDA_CHECK(cudaMemcpy(dev_a, a, n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev_b, b, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Tune number of blocks
+    int blocks = min(1024, (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+
+    // Launch kernel
+    dot_product_kernel<<<blocks, THREADS_PER_BLOCK>>>(dev_a, dev_b, n, dev_result);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy result back
+    CUDA_CHECK(cudaMemcpy(&result, dev_result, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    cudaFree(dev_a);
+    cudaFree(dev_b);
+    cudaFree(dev_result);
+
+    return result;
+}
+
+int main() {
+    int N = 50'000'000;
+
+    // Use pinned memory for faster transfer
+    float *a, *b;
+    CUDA_CHECK(cudaMallocHost(&a, N * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&b, N * sizeof(float)));
+
     random_device rd;
     mt19937 gen(rd());
     uniform_real_distribution<float> dis(1.0f, 100.0f);
 
-    for (int i = 0; i < N; ++i)
-    {
+    for (int i = 0; i < N; ++i) {
         a[i] = dis(gen);
         b[i] = dis(gen);
     }
 
-    float *c = new float[BLOCKS_PER_GRID];
-    float *dev_c, *dev_a, *dev_b;
+    // Measure time
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
 
-    CUDA_CHECK(cudaMalloc((void **)&dev_c, BLOCKS_PER_GRID * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void **)&dev_a, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void **)&dev_b, N * sizeof(float)));
+    float result = compute_dot_product(a, b, N);
 
-    CUDA_CHECK(cudaMemset(dev_c, 0, BLOCKS_PER_GRID * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(dev_a, a, N * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dev_b, b, N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
-    dot_product<<<BLOCKS_PER_GRID, THREADS_PER_BLOCK>>>(dev_a, dev_b, N, dev_c);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
 
-    CUDA_CHECK(cudaMemcpy(c, dev_c, BLOCKS_PER_GRID * sizeof(float), cudaMemcpyDeviceToHost));
+    cout << "Dot product: " << result << endl;
+    cout << "Time: " << milliseconds << " ms" << endl;
 
-    // Final reduction on the host
-    float result = 0.0f;
-    for (int i = 0; i < BLOCKS_PER_GRID; ++i)
-    {
-        result += c[i];
-    }
-
-    cout << "Dot product result: " << result << endl;
-
-    // Free device memory
-    CUDA_CHECK(cudaFree(dev_c));
-    CUDA_CHECK(cudaFree(dev_a));
-    CUDA_CHECK(cudaFree(dev_b));
-    // Free host memory
-    delete[] c;
-    delete[] a;
-    delete[] b;
-
+    CUDA_CHECK(cudaFreeHost(a));
+    CUDA_CHECK(cudaFreeHost(b));
     return 0;
 }
